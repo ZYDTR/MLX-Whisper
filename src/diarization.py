@@ -133,16 +133,24 @@ class SpeakerDiarizer:
             
             # 执行声纹分割
             if self.num_speakers is not None:
-                diarization = self._pipeline(
+                result = self._pipeline(
                     audio_input,
                     num_speakers=self.num_speakers
                 )
             else:
-                diarization = self._pipeline(
+                result = self._pipeline(
                     audio_input,
                     min_speakers=self.min_speakers,
                     max_speakers=self.max_speakers
                 )
+            
+            # pyannote 4.x 返回 DiarizeOutput 对象
+            # 需要访问 .speaker_diarization 属性获取 Annotation
+            if hasattr(result, 'speaker_diarization'):
+                diarization = result.speaker_diarization
+            else:
+                # 兼容旧版本
+                diarization = result
             
             # 转换为标准格式
             segments = []
