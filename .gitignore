@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+*.manifest
+*.spec
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+
+# MLX models cache
+mlx_models/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Audio/Video files (test data)
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.webm
+*.mp4
+*.avi
+*.mov
+
+# Test output files
+*_transcription.json
+*_transcription.txt
+*_output*.json
+*_output*.txt
+
