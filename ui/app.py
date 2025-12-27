@@ -890,6 +890,18 @@ CSS = """
     margin: 10px 0;
     border-radius: 0 8px 8px 0;
 }
+
+/* 上传文件按钮 - 橙色背景 */
+#upload_file_btn {
+    background-color: #FF9800 !important;
+    border-color: #FF9800 !important;
+    color: white !important;
+}
+
+#upload_file_btn:hover {
+    background-color: #F57C00 !important;
+    border-color: #F57C00 !important;
+}
 """
 
 def create_ui():
@@ -909,14 +921,28 @@ def create_ui():
             # ===== 左栏：配置 =====
             with gr.Column(scale=1):
                 
-                # 音频上传 - 支持重复点击上传
+                # 音频上传 - 支持多文件上传
                 audio_input = gr.File(
-                    label="📁 上传音频文件（点击可重新选择）",
+                    label="📁 上传音频文件（支持多文件，每个文件末尾可单独删除）",
                     file_types=[".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm"],
-                    file_count="single"
+                    file_count="multiple",
+                    elem_id="audio_file_input"
                 )
-                # 清除文件按钮
-                clear_file_btn = gr.Button("🗑️ 清除已上传文件", size="sm", variant="secondary")
+                # 上传和清除按钮行
+                with gr.Row():
+                    upload_file_btn = gr.Button(
+                        "📤 上传文件",
+                        size="sm",
+                        variant="primary",
+                        elem_id="upload_file_btn",
+                        scale=1
+                    )
+                    clear_file_btn = gr.Button(
+                        "🗑️ 清除所有已上传文件",
+                        size="sm",
+                        variant="secondary",
+                        scale=1
+                    )
                 
                 # 转录时间范围
                 gr.Markdown("##### ⏱️ 转录时间范围（留空=全部）")
@@ -1107,8 +1133,8 @@ def create_ui():
                 
                 with gr.Row():
                     download_txt_btn = gr.DownloadButton("📥 TXT", size="sm", variant="primary")
-                    download_json_btn = gr.DownloadButton("📥 JSON", size="sm")
-                    download_srt_btn = gr.DownloadButton("📥 SRT", size="sm")
+                    download_json_btn = gr.DownloadButton("📥 JSON", size="sm", variant="primary")
+                    download_srt_btn = gr.DownloadButton("📥 SRT", size="sm", variant="primary")
         
         # ===== 事件绑定 =====
         
@@ -1163,15 +1189,20 @@ def create_ui():
             temperature,
             initial_prompt,
         ):
+            # 处理文件列表（支持单个文件或多个文件）
             if audio_file is None:
                 yield "请先上传音频文件", "请先上传音频文件", "❌ 请先上传音频文件"
                 return
             
-            # 获取音频路径
-            if hasattr(audio_file, 'name'):
-                audio_path = audio_file.name
+            # 将单个文件转换为列表格式，统一处理
+            if not isinstance(audio_file, list):
+                audio_files = [audio_file]
             else:
-                audio_path = str(audio_file)
+                audio_files = audio_file
+            
+            if len(audio_files) == 0:
+                yield "请先上传音频文件", "请先上传音频文件", "❌ 请先上传音频文件"
+                return
             
             # 处理 num_speakers - 空字符串表示自动检测
             num_speakers = None
@@ -1203,27 +1234,88 @@ def create_ui():
                 except ValueError:
                     end_minutes = None
             
-            # 调用转录函数
-            for log_text, result_text, status in transcribe_audio(
-                audio_path=audio_path,
-                model_key=model_key,
-                language_key=language_key,
-                preset_key=preset_key,
-                enable_diarization=enable_diarization,
-                num_speakers=num_speakers,
-                hf_token=hf_token,
-                vad_key=vad_key,
-                batch_size=int(batch_size),
-                start_minutes=start_minutes,
-                end_minutes=end_minutes,
-                no_speech_threshold=no_speech_threshold,
-                logprob_threshold=logprob_threshold,
-                compression_ratio_threshold=compression_ratio_threshold,
-                condition_on_previous_text=condition_on_previous_text,
-                temperature=temperature,
-                initial_prompt=initial_prompt,
-            ):
-                yield log_text, result_text, status
+            # 处理多个文件：逐个转录并合并结果
+            all_logs = []
+            all_results_text = ""
+            is_multiple = len(audio_files) > 1
+            
+            for file_idx, audio_file_item in enumerate(audio_files):
+                # 获取音频路径
+                if hasattr(audio_file_item, 'name'):
+                    audio_path = audio_file_item.name
+                else:
+                    audio_path = str(audio_file_item)
+                
+                # 如果是多个文件，添加文件分隔信息
+                file_separator = ""
+                if is_multiple:
+                    file_separator = f"\n{'='*60}\n文件 {file_idx + 1}/{len(audio_files)}: {Path(audio_path).name}\n{'='*60}\n"
+                    all_logs.append(file_separator)
+                    if all_results_text:
+                        all_results_text += "\n\n" + file_separator + "\n"
+                    else:
+                        all_results_text = file_separator + "\n"
+                    yield "\n".join(all_logs), all_results_text, f"⏳ 处理文件 {file_idx + 1}/{len(audio_files)}..."
+                
+                # 调用转录函数
+                file_result = ""
+                for log_text, result_text, status in transcribe_audio(
+                    audio_path=audio_path,
+                    model_key=model_key,
+                    language_key=language_key,
+                    preset_key=preset_key,
+                    enable_diarization=enable_diarization,
+                    num_speakers=num_speakers,
+                    hf_token=hf_token,
+                    vad_key=vad_key,
+                    batch_size=int(batch_size),
+                    start_minutes=start_minutes,
+                    end_minutes=end_minutes,
+                    no_speech_threshold=no_speech_threshold,
+                    logprob_threshold=logprob_threshold,
+                    compression_ratio_threshold=compression_ratio_threshold,
+                    condition_on_previous_text=condition_on_previous_text,
+                    temperature=temperature,
+                    initial_prompt=initial_prompt,
+                ):
+                    all_logs.append(log_text)
+                    if result_text:
+                        file_result = result_text
+                        # 更新结果：对于多文件，追加结果；对于单文件，替换结果
+                        if is_multiple and file_separator:
+                            # 多文件模式：更新当前文件的结果部分
+                            # 找到当前文件分隔符的位置
+                            if file_separator in all_results_text:
+                                # 替换分隔符后的内容（保留分隔符）
+                                parts = all_results_text.split(file_separator, 1)
+                                if len(parts) == 2:
+                                    all_results_text = parts[0] + file_separator + "\n" + file_result
+                                else:
+                                    all_results_text += file_result
+                            else:
+                                all_results_text += file_result
+                        else:
+                            # 单文件模式：直接替换结果
+                            all_results_text = file_result
+                    
+                    # 更新状态
+                    if is_multiple:
+                        current_status = f"{status} | 文件 {file_idx + 1}/{len(audio_files)}"
+                    else:
+                        current_status = status
+                    yield "\n".join(all_logs), all_results_text, current_status
+                
+                # 文件处理完成，添加分隔（多文件模式）
+                if is_multiple and file_idx < len(audio_files) - 1:
+                    all_logs.append("")
+                    all_results_text += "\n\n"
+            
+            # 所有文件处理完成
+            if is_multiple:
+                final_status = f"✅ 全部完成 | 共处理 {len(audio_files)} 个文件"
+            else:
+                final_status = "✅ 完成"
+            yield "\n".join(all_logs), all_results_text, final_status
         
         submit_btn.click(
             fn=on_submit,
@@ -1247,6 +1339,34 @@ def create_ui():
                 initial_prompt
             ],
             outputs=[log_output, result_output, status_text]
+        )
+        
+        # 上传文件按钮 - 触发文件选择对话框
+        upload_file_btn.click(
+            fn=None,
+            js="""
+            () => {
+                // 查找文件输入框 - 尝试多种选择器
+                let fileInput = document.querySelector('#audio_file_input input[type="file"]');
+                if (!fileInput) {
+                    // 如果直接选择器找不到，尝试查找包含 audio_file_input 的容器内的文件输入
+                    const container = document.querySelector('[id*="audio_file_input"], [data-testid*="audio_file_input"]');
+                    if (container) {
+                        fileInput = container.querySelector('input[type="file"]');
+                    }
+                }
+                if (!fileInput) {
+                    // 最后尝试查找所有文件输入，选择第一个
+                    const allFileInputs = document.querySelectorAll('input[type="file"]');
+                    if (allFileInputs.length > 0) {
+                        fileInput = allFileInputs[0];
+                    }
+                }
+                if (fileInput) {
+                    fileInput.click();
+                }
+            }
+            """
         )
         
         # 清除文件按钮
