@@ -32,6 +32,173 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
+# ========== VAD 相关函数 ==========
+
+def apply_vad_to_audio(
+    audio: np.ndarray, 
+    sample_rate: int,
+    vad_threshold: float,
+    log_fn
+) -> Tuple[np.ndarray, List[Tuple[float, float]], float]:
+    """
+    应用 VAD 过滤静音区域
+    
+    Args:
+        audio: 原始音频数据
+        sample_rate: 采样率
+        vad_threshold: VAD 阈值 (0-1)
+        log_fn: 日志函数
+    
+    Returns:
+        (处理后的音频, 语音片段映射表 [(原始开始, 原始结束), ...], 跳过的静音时长)
+    """
+    try:
+        import torch
+        
+        # 加载 Silero VAD
+        model, utils = torch.hub.load(
+            repo_or_dir='snakers4/silero-vad',
+            model='silero_vad',
+            force_reload=False,
+            onnx=True
+        )
+        get_speech_timestamps = utils[0]
+        
+        # 转换为 torch tensor
+        audio_tensor = torch.from_numpy(audio.astype(np.float32))
+        
+        # 检测语音片段
+        speech_timestamps = get_speech_timestamps(
+            audio_tensor,
+            model,
+            threshold=vad_threshold,
+            sampling_rate=sample_rate,
+            min_speech_duration_ms=250,
+            min_silence_duration_ms=100
+        )
+        
+        if not speech_timestamps:
+            # 没有检测到语音，返回原始音频
+            log_fn("   ⚠️ VAD 未检测到语音片段，使用原始音频")
+            return audio, [(0.0, len(audio) / sample_rate)], 0.0
+        
+        # 提取语音片段并记录映射
+        speech_segments = []
+        segment_mapping = []  # [(原始开始时间, 原始结束时间), ...]
+        
+        total_original_duration = len(audio) / sample_rate
+        total_speech_duration = 0.0
+        
+        for ts in speech_timestamps:
+            start_sample = max(0, ts['start'] - int(0.1 * sample_rate))  # 100ms padding
+            end_sample = min(len(audio), ts['end'] + int(0.1 * sample_rate))  # 100ms padding
+            
+            start_time = start_sample / sample_rate
+            end_time = end_sample / sample_rate
+            
+            segment_audio = audio[start_sample:end_sample]
+            speech_segments.append(segment_audio)
+            segment_mapping.append((start_time, end_time))
+            
+            total_speech_duration += end_time - start_time
+        
+        # 拼接所有语音片段
+        concatenated_audio = np.concatenate(speech_segments)
+        
+        silence_skipped = total_original_duration - total_speech_duration
+        
+        log_fn(f"   ✅ VAD 检测完成:")
+        log_fn(f"      • 检测到 {len(speech_timestamps)} 个语音片段")
+        log_fn(f"      • 原始时长: {total_original_duration:.1f}s → 有效语音: {total_speech_duration:.1f}s")
+        log_fn(f"      • 跳过静音: {silence_skipped:.1f}s ({silence_skipped/total_original_duration*100:.1f}%)")
+        
+        return concatenated_audio, segment_mapping, silence_skipped
+        
+    except ImportError as e:
+        log_fn(f"   ⚠️ VAD 依赖缺失: {e}")
+        log_fn("   ⚠️ 使用原始音频（未应用 VAD）")
+        return audio, [(0.0, len(audio) / sample_rate)], 0.0
+    except Exception as e:
+        log_fn(f"   ⚠️ VAD 处理失败: {e}")
+        log_fn("   ⚠️ 使用原始音频（未应用 VAD）")
+        return audio, [(0.0, len(audio) / sample_rate)], 0.0
+
+
+def map_timestamps_to_original(
+    segments: List[dict],
+    segment_mapping: List[Tuple[float, float]],
+    sample_rate: int = 16000
+) -> List[dict]:
+    """
+    将转录结果的时间戳映射回原始音频的时间
+    
+    Args:
+        segments: mlx_whisper 返回的 segments 列表
+        segment_mapping: VAD 语音片段映射表 [(原始开始, 原始结束), ...]
+        sample_rate: 采样率
+    
+    Returns:
+        时间戳已调整的 segments 列表
+    """
+    if len(segment_mapping) == 1 and segment_mapping[0][0] == 0.0:
+        # 没有应用 VAD 或只有一个从 0 开始的片段
+        return segments
+    
+    # 构建拼接音频的时间映射表
+    # concat_time -> original_time
+    cumulative_time = 0.0
+    time_map = []  # [(concat_start, concat_end, original_start, original_end), ...]
+    
+    for orig_start, orig_end in segment_mapping:
+        duration = orig_end - orig_start
+        concat_start = cumulative_time
+        concat_end = cumulative_time + duration
+        time_map.append((concat_start, concat_end, orig_start, orig_end))
+        cumulative_time += duration
+    
+    def map_time(concat_time: float) -> float:
+        """将拼接音频的时间映射到原始音频时间"""
+        # 使用容差处理边界情况
+        epsilon = 1e-6
+        
+        for i, (concat_start, concat_end, orig_start, orig_end) in enumerate(time_map):
+            # 在当前片段范围内（包含边界）
+            if concat_start - epsilon <= concat_time <= concat_end + epsilon:
+                # 计算相对偏移
+                offset = concat_time - concat_start
+                # 确保不超出原始片段
+                offset = max(0, min(offset, orig_end - orig_start))
+                return orig_start + offset
+        
+        # 超出范围，返回最后一个片段的结束时间
+        if time_map:
+            return time_map[-1][3]
+        return concat_time
+    
+    # 调整每个 segment 的时间戳
+    adjusted_segments = []
+    for seg in segments:
+        new_seg = seg.copy()
+        new_seg['start'] = map_time(seg.get('start', 0))
+        new_seg['end'] = map_time(seg.get('end', 0))
+        
+        # 如果有 word 级别时间戳，也需要调整
+        if 'words' in new_seg and new_seg['words']:
+            new_words = []
+            for word in new_seg['words']:
+                new_word = word.copy()
+                if 'start' in word:
+                    new_word['start'] = map_time(word['start'])
+                if 'end' in word:
+                    new_word['end'] = map_time(word['end'])
+                new_words.append(new_word)
+            new_seg['words'] = new_words
+        
+        adjusted_segments.append(new_seg)
+    
+    return adjusted_segments
+
+
 # ========== 配置常量 ==========
 
 # 模型配置
@@ -76,14 +243,15 @@ VAD_CHOICES = [opt[0] for opt in VAD_OPTIONS]
 VAD_VALUE_MAP = {opt[0]: opt[1] for opt in VAD_OPTIONS}
 
 # 预设场景 - 包含所有联动参数
+# 注意：所有预设默认开启说话人分离（自动检测），如只有1人则不显示标签
 PRESETS = {
     "📌 标准模式": {
-        "description": "清晰录音、播客、采访、专业设备录制",
+        "description": "清晰录音、播客、采访、专业设备录制 - 自动检测说话人",
         "model": "Large-v3 (精准)",
         "batch_size": 12,
         "vad": "平衡 (0.5) - 默认，大多数场景",
-        "enable_diarization": False,
-        "num_speakers": None,
+        "enable_diarization": True,
+        "num_speakers": None,  # 自动检测
         "no_speech_threshold": 0.6,
         "logprob_threshold": -1.0,
         "compression_ratio_threshold": 2.4,
@@ -91,12 +259,12 @@ PRESETS = {
         "temperature": 0.0,
     },
     "📞 电话/低音质": {
-        "description": "电话录音、远程通话、低音量、手机录音 - 自动启用说话人分离",
+        "description": "电话录音、远程通话、低音量、手机录音 - 默认2人对话",
         "model": "Large-v3 (精准)",
         "batch_size": 12,
         "vad": "禁用 VAD - 不跳过任何内容",
         "enable_diarization": True,
-        "num_speakers": 2,
+        "num_speakers": 2,  # 电话默认2人
         "no_speech_threshold": 0.1,
         "logprob_threshold": -2.5,
         "compression_ratio_threshold": 5.0,
@@ -104,12 +272,12 @@ PRESETS = {
         "temperature": 0.0,
     },
     "🏢 会议录音": {
-        "description": "多人会议、讨论 - 自动启用说话人分离，需要上下文连贯",
+        "description": "多人会议、讨论 - 自动检测说话人数量",
         "model": "Large-v3 (精准)",
         "batch_size": 12,
         "vad": "敏感 (0.3) - 安静环境、远场",
         "enable_diarization": True,
-        "num_speakers": None,
+        "num_speakers": None,  # 自动检测
         "no_speech_threshold": 0.5,
         "logprob_threshold": -1.5,
         "compression_ratio_threshold": 3.0,
@@ -117,12 +285,12 @@ PRESETS = {
         "temperature": 0.0,
     },
     "🎧 嘈杂环境": {
-        "description": "户外录音、背景噪音大、咖啡厅等 - 严格过滤噪音",
+        "description": "户外录音、背景噪音大、咖啡厅等 - 自动检测说话人",
         "model": "Large-v3 (精准)",
         "batch_size": 12,
         "vad": "严格 (0.7) - 有背景噪音",
-        "enable_diarization": False,
-        "num_speakers": None,
+        "enable_diarization": True,
+        "num_speakers": None,  # 自动检测
         "no_speech_threshold": 0.7,
         "logprob_threshold": -1.0,
         "compression_ratio_threshold": 2.4,
@@ -130,12 +298,12 @@ PRESETS = {
         "temperature": 0.0,
     },
     "⚡ 快速转录": {
-        "description": "使用 Turbo 模型，速度优先 - 适合长音频或批量处理",
+        "description": "使用 Turbo 模型，速度优先 - 自动检测说话人",
         "model": "Large-v3-turbo (快速)",
         "batch_size": 36,
         "vad": "平衡 (0.5) - 默认，大多数场景",
-        "enable_diarization": False,
-        "num_speakers": None,
+        "enable_diarization": True,
+        "num_speakers": None,  # 自动检测
         "no_speech_threshold": 0.6,
         "logprob_threshold": -1.0,
         "compression_ratio_threshold": 2.4,
@@ -143,12 +311,12 @@ PRESETS = {
         "temperature": 0.0,
     },
     "🔧 自定义": {
-        "description": "手动调节所有参数 - 下方参数可自由调整",
+        "description": "手动调节所有参数 - 可关闭说话人分离",
         "model": "Large-v3 (精准)",
         "batch_size": 12,
         "vad": "平衡 (0.5) - 默认，大多数场景",
-        "enable_diarization": False,
-        "num_speakers": None,
+        "enable_diarization": True,
+        "num_speakers": None,  # 自动检测
         "no_speech_threshold": 0.6,
         "logprob_threshold": -1.0,
         "compression_ratio_threshold": 2.4,
@@ -200,7 +368,8 @@ def transcribe_audio(
     hf_token: str,
     vad_key: str,
     batch_size: int,
-    duration_minutes: Optional[float],
+    start_minutes: Optional[float],
+    end_minutes: Optional[float],
     # 高级参数
     no_speech_threshold: float,
     logprob_threshold: float,
@@ -249,8 +418,13 @@ def transcribe_audio(
         yield log("📊 当前参数配置:"), "", "⏳ 准备中..."
         yield log("─" * 40), "", "⏳ 准备中..."
         yield log(f"   ⚡ Batch Size: {batch_size}"), "", "⏳ 准备中..."
-        yield log(f"   🔊 VAD: {vad_key}"), "", "⏳ 准备中..."
-        yield log(f"      → 实际值: {vad_threshold if vad_threshold else '禁用 (不跳过静音)'}"), "", "⏳ 准备中..."
+        
+        # VAD 状态显示 - 现在会真正生效
+        if vad_threshold is not None:
+            yield log(f"   🔊 VAD: {vad_key} ✅ 已启用"), "", "⏳ 准备中..."
+            yield log(f"      → 阈值: {vad_threshold} (将跳过静音区域)"), "", "⏳ 准备中..."
+        else:
+            yield log(f"   🔊 VAD: 禁用 (不跳过任何内容)"), "", "⏳ 准备中..."
         yield log(""), "", "⏳ 准备中..."
         yield log(f"   🎯 Whisper 高级参数:"), "", "⏳ 准备中..."
         yield log(f"      • no_speech_threshold = {no_speech_threshold}"), "", "⏳ 准备中..."
@@ -279,11 +453,27 @@ def transcribe_audio(
         
         load_start = time.time()
         
-        # 确定加载时长
-        if duration_minutes and duration_minutes > 0:
-            duration_seconds = duration_minutes * 60
-            yield log(f"   ⏱️ 只加载前 {duration_minutes} 分钟 ({duration_seconds:.0f} 秒)"), "", "📂 加载音频..."
-            audio, sr = librosa.load(audio_path, sr=16000, mono=True, duration=duration_seconds)
+        # 确定加载时间范围
+        offset_seconds = 0.0
+        duration_seconds = None
+        
+        if start_minutes and start_minutes > 0:
+            offset_seconds = start_minutes * 60
+        
+        if end_minutes and end_minutes > 0:
+            end_seconds = end_minutes * 60
+            if end_seconds > offset_seconds:
+                duration_seconds = end_seconds - offset_seconds
+        
+        # 显示加载信息
+        if offset_seconds > 0 or duration_seconds is not None:
+            if offset_seconds > 0 and duration_seconds is not None:
+                yield log(f"   ⏱️ 加载时间范围: {start_minutes:.1f} 到 {end_minutes:.1f} 分钟"), "", "📂 加载音频..."
+            elif offset_seconds > 0:
+                yield log(f"   ⏱️ 从 {start_minutes:.1f} 分钟开始加载到结尾"), "", "📂 加载音频..."
+            else:
+                yield log(f"   ⏱️ 只加载前 {end_minutes:.1f} 分钟"), "", "📂 加载音频..."
+            audio, sr = librosa.load(audio_path, sr=16000, mono=True, offset=offset_seconds, duration=duration_seconds)
         else:
             yield log(f"   📁 加载完整音频"), "", "📂 加载音频..."
             audio, sr = librosa.load(audio_path, sr=16000, mono=True)
@@ -295,9 +485,58 @@ def transcribe_audio(
         yield log(f"   📊 音频时长: {audio_duration:.1f} 秒 ({audio_duration/60:.1f} 分钟)"), "", "📂 加载音频..."
         yield log(f"   ⏱️ 加载耗时: {load_time:.2f} 秒"), "", "📂 加载音频..."
         
+        # ===== VAD 预处理 =====
+        segment_mapping = [(0.0, audio_duration)]  # 默认：整个音频
+        audio_for_transcription = audio
+        vad_applied = False
+        silence_skipped = 0.0
+        
+        if vad_threshold is not None:
+            yield log(""), "", "🔊 VAD 处理中..."
+            yield log("🔊 正在应用 VAD (语音活动检测)..."), "", "🔊 VAD 处理中..."
+            yield log(f"   阈值: {vad_threshold}"), "", "🔊 VAD 处理中..."
+            
+            vad_start = time.time()
+            
+            def vad_log(msg):
+                logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+            
+            audio_for_transcription, segment_mapping, silence_skipped = apply_vad_to_audio(
+                audio=audio,
+                sample_rate=sr,
+                vad_threshold=vad_threshold,
+                log_fn=vad_log
+            )
+            
+            yield "\n".join(logs), "", "🔊 VAD 处理中..."
+            
+            vad_time = time.time() - vad_start
+            yield log(f"   ⏱️ VAD 处理耗时: {vad_time:.2f} 秒"), "", "🔊 VAD 处理中..."
+            
+            # 检查是否真的应用了 VAD（不是 fallback）
+            num_vad_segments = len(segment_mapping)
+            if num_vad_segments > 1 or segment_mapping[0][0] != 0.0:
+                vad_applied = True
+                # 醒目的 VAD 结果摘要
+                yield log(""), "", "🔊 VAD 完成"
+                yield log("─" * 40), "", "🔊 VAD 完成"
+                yield log(f"🔊 ✅ VAD 实际生效: 切分为 {num_vad_segments} 个语音片段"), "", "🔊 VAD 完成"
+                effective_audio_duration = len(audio_for_transcription) / sr
+                yield log(f"   原始: {audio_duration:.1f}s → 有效: {effective_audio_duration:.1f}s (节省 {silence_skipped:.1f}s)"), "", "🔊 VAD 完成"
+                yield log("─" * 40), "", "🔊 VAD 完成"
+            else:
+                # VAD 没有检测到可切分的片段
+                yield log(""), "", "🔊 VAD 完成"
+                yield log(f"🔊 ⚠️ VAD 未切分: 整段音频被视为连续语音"), "", "🔊 VAD 完成"
+        
         # ===== 转录 =====
         yield log(""), "", "🎤 转录中..."
         yield log("🎤 开始 ASR 转录..."), "", "🎤 转录中..."
+        if vad_applied:
+            effective_duration = len(audio_for_transcription) / sr
+            yield log(f"   📊 [VAD已启用] 转录有效音频: {effective_duration:.1f}s (原始 {audio_duration:.1f}s)"), "", "🎤 转录中..."
+        else:
+            yield log(f"   📊 [无VAD] 转录完整音频: {audio_duration:.1f}s"), "", "🎤 转录中..."
         yield log("   ⏳ 首次运行需要下载模型，请耐心等待..."), "", "🎤 转录中..."
         
         import mlx_whisper
@@ -322,17 +561,26 @@ def transcribe_audio(
         
         yield log("   🔄 模型加载中..."), "", "🎤 转录中..."
         
-        result = mlx_whisper.transcribe(audio, **transcribe_params)
+        # 使用 VAD 处理后的音频进行转录
+        result = mlx_whisper.transcribe(audio_for_transcription, **transcribe_params)
         
         transcribe_time = time.time() - transcribe_start
         realtime_ratio = audio_duration / transcribe_time if transcribe_time > 0 else 0
         
         segments = result.get('segments', [])
+        
+        # 如果应用了 VAD，将时间戳映射回原始音频
+        if vad_applied:
+            yield log("   🔄 映射时间戳到原始音频..."), "", "🎤 转录中..."
+            segments = map_timestamps_to_original(segments, segment_mapping, sr)
+        
         text = result.get('text', '')
         
         yield log(f"   ✅ 转录完成!"), "", "🎤 转录完成"
         yield log(f"   ⏱️ 处理时间: {transcribe_time:.1f} 秒"), "", "🎤 转录完成"
         yield log(f"   📊 实时比: {realtime_ratio:.2f}x (>1 表示比实时快)"), "", "🎤 转录完成"
+        if vad_applied:
+            yield log(f"   🔊 VAD 效果: 跳过 {silence_skipped:.1f}s 静音"), "", "🎤 转录完成"
         yield log(f"   📝 识别段落: {len(segments)} 个"), "", "🎤 转录完成"
         yield log(f"   📄 文本长度: {len(text)} 字符"), "", "🎤 转录完成"
         
@@ -367,9 +615,15 @@ def transcribe_audio(
                 diarize_time = time.time() - diarize_start
                 
                 unique_speakers = set(s[0] for s in speaker_segments)
+                num_detected = len(unique_speakers)
                 yield log(f"   ✅ 说话人分离完成!"), "", "👥 说话人分离完成"
                 yield log(f"   ⏱️ 处理时间: {diarize_time:.1f} 秒"), "", "👥 说话人分离完成"
-                yield log(f"   📊 检测到 {len(unique_speakers)} 个说话人: {', '.join(sorted(unique_speakers))}"), "", "👥 说话人分离完成"
+                if num_detected > 1:
+                    yield log(f"   📊 检测到 {num_detected} 个说话人: {', '.join(sorted(unique_speakers))}"), "", "👥 说话人分离完成"
+                    yield log(f"   📝 结果将显示说话人标签 (A, B, C...)"), "", "👥 说话人分离完成"
+                else:
+                    yield log(f"   📊 检测到 1 个说话人 (单人录音)"), "", "👥 说话人分离完成"
+                    yield log(f"   📝 结果将不显示说话人标签"), "", "👥 说话人分离完成"
                 
             except Exception as e:
                 yield log(f"   ⚠️ 说话人分离失败: {str(e)}"), "", "👥 说话人分离失败"
@@ -417,6 +671,19 @@ def transcribe_audio(
                 "speaker": speaker
             })
         
+        # 统计检测到的说话人数量
+        unique_speakers_detected = set()
+        for seg in processed_segments:
+            if seg.get('speaker'):
+                unique_speakers_detected.add(seg['speaker'])
+        num_speakers_detected = len(unique_speakers_detected)
+        
+        # 如果只有1个说话人，清除所有说话人标签（不需要区分）
+        show_speaker_labels = num_speakers_detected > 1
+        if not show_speaker_labels:
+            for seg in processed_segments:
+                seg['speaker'] = None
+        
         # 保存结果到全局变量
         LAST_RESULT["segments"] = processed_segments
         LAST_RESULT["text"] = text
@@ -424,6 +691,7 @@ def transcribe_audio(
         LAST_RESULT["audio_duration"] = audio_duration
         LAST_RESULT["model"] = model_key
         LAST_RESULT["preset"] = preset_key
+        LAST_RESULT["num_speakers"] = num_speakers_detected  # 保存检测到的说话人数量
         
         # 生成显示文本 - 完整格式（带时间戳）
         result_lines = []
@@ -432,13 +700,18 @@ def transcribe_audio(
         result_lines.append(f"时长: {audio_duration:.1f}s ({audio_duration/60:.1f}分钟)")
         result_lines.append(f"模型: {model_key}")
         result_lines.append(f"耗时: {transcribe_time:.1f}s (实时比: {realtime_ratio:.1f}x)")
+        if enable_diarization:
+            if num_speakers_detected > 1:
+                result_lines.append(f"说话人: 检测到 {num_speakers_detected} 人")
+            else:
+                result_lines.append(f"说话人: 单人 (不显示标签)")
         result_lines.append("")
         result_lines.append("─" * 40)
         
         for seg in processed_segments:
             time_str = f"[{format_time(seg['start'])} → {format_time(seg['end'])}]"
             spk = seg.get('speaker')
-            if spk:
+            if spk and show_speaker_labels:
                 result_lines.append(f"{time_str} {spk}")
             else:
                 result_lines.append(time_str)
@@ -454,7 +727,10 @@ def transcribe_audio(
         yield log(f"   📊 总耗时: {time.time() - load_start:.1f} 秒"), result_text, "📝 生成结果..."
         yield log("═" * 50), result_text, "📝 生成结果..."
         
-        final_status = f"✅ 完成 | 时长 {audio_duration:.0f}s | 耗时 {transcribe_time:.0f}s | 实时比 {realtime_ratio:.1f}x"
+        if vad_applied:
+            final_status = f"✅ 完成 | 时长 {audio_duration:.0f}s | VAD跳过 {silence_skipped:.0f}s | 耗时 {transcribe_time:.0f}s | 实时比 {realtime_ratio:.1f}x"
+        else:
+            final_status = f"✅ 完成 | 时长 {audio_duration:.0f}s | 耗时 {transcribe_time:.0f}s | 实时比 {realtime_ratio:.1f}x"
         yield "\n".join(logs), result_text, final_status
         
     except Exception as e:
@@ -633,20 +909,30 @@ def create_ui():
             # ===== 左栏：配置 =====
             with gr.Column(scale=1):
                 
-                # 音频上传
+                # 音频上传 - 支持重复点击上传
                 audio_input = gr.File(
-                    label="📁 上传音频文件",
+                    label="📁 上传音频文件（点击可重新选择）",
                     file_types=[".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm"],
                     file_count="single"
                 )
+                # 清除文件按钮
+                clear_file_btn = gr.Button("🗑️ 清除已上传文件", size="sm", variant="secondary")
                 
-                # 转录时长（单文件时可用）- 默认空，不是0
-                duration_minutes = gr.Textbox(
-                    label="⏱️ 只转录前 N 分钟（留空=全部）",
-                    value="",
-                    placeholder="留空表示转录全部，输入数字如 2 表示前2分钟",
-                    info="留空=转录全部内容"
-                )
+                # 转录时间范围
+                gr.Markdown("##### ⏱️ 转录时间范围（留空=全部）")
+                with gr.Row():
+                    start_minutes = gr.Textbox(
+                        label="开始 (分钟)",
+                        value="",
+                        placeholder="0",
+                        info="留空或0=从头开始"
+                    )
+                    end_minutes = gr.Textbox(
+                        label="结束 (分钟)",
+                        value="",
+                        placeholder="留空=到结尾",
+                        info="留空=转录到结尾"
+                    )
                 
                 gr.Markdown("---")
                 
@@ -710,8 +996,8 @@ def create_ui():
                 
                 enable_diarization = gr.Checkbox(
                     label="启用说话人分离",
-                    value=False,
-                    info="识别不同说话人，适合多人对话/会议/电话"
+                    value=True,  # 默认开启，自动检测说话人
+                    info="自动检测说话人数量，单人时不显示标签，关闭则强制不检测"
                 )
                 
                 with gr.Row():
@@ -868,7 +1154,8 @@ def create_ui():
             hf_token,
             vad_key,
             batch_size,
-            duration_minutes_str,
+            start_minutes_str,
+            end_minutes_str,
             no_speech_threshold,
             logprob_threshold,
             compression_ratio_threshold,
@@ -896,15 +1183,25 @@ def create_ui():
                 except ValueError:
                     num_speakers = None
             
-            # 处理 duration_minutes - 空字符串表示全部
-            duration_minutes = None
-            if duration_minutes_str and duration_minutes_str.strip():
+            # 处理开始时间 - 空或0表示从头开始
+            start_minutes = None
+            if start_minutes_str and start_minutes_str.strip():
                 try:
-                    duration_minutes = float(duration_minutes_str.strip())
-                    if duration_minutes <= 0:
-                        duration_minutes = None
+                    start_minutes = float(start_minutes_str.strip())
+                    if start_minutes < 0:
+                        start_minutes = None
                 except ValueError:
-                    duration_minutes = None
+                    start_minutes = None
+            
+            # 处理结束时间 - 空表示到结尾
+            end_minutes = None
+            if end_minutes_str and end_minutes_str.strip():
+                try:
+                    end_minutes = float(end_minutes_str.strip())
+                    if end_minutes <= 0:
+                        end_minutes = None
+                except ValueError:
+                    end_minutes = None
             
             # 调用转录函数
             for log_text, result_text, status in transcribe_audio(
@@ -917,7 +1214,8 @@ def create_ui():
                 hf_token=hf_token,
                 vad_key=vad_key,
                 batch_size=int(batch_size),
-                duration_minutes=duration_minutes,
+                start_minutes=start_minutes,
+                end_minutes=end_minutes,
                 no_speech_threshold=no_speech_threshold,
                 logprob_threshold=logprob_threshold,
                 compression_ratio_threshold=compression_ratio_threshold,
@@ -939,7 +1237,8 @@ def create_ui():
                 hf_token,
                 vad_dropdown,
                 batch_size,
-                duration_minutes,
+                start_minutes,
+                end_minutes,
                 no_speech_threshold,
                 logprob_threshold,
                 compression_ratio_threshold,
@@ -948,6 +1247,12 @@ def create_ui():
                 initial_prompt
             ],
             outputs=[log_output, result_output, status_text]
+        )
+        
+        # 清除文件按钮
+        clear_file_btn.click(
+            fn=lambda: None,
+            outputs=[audio_input]
         )
     
     return app

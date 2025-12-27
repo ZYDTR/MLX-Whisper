@@ -101,6 +101,14 @@ if ! $PYTHON_CMD -c "import librosa" 2>/dev/null; then
     MISSING_DEPS+=("librosa")
 fi
 
+# 检查 VAD 依赖 (onnxruntime for Silero VAD)
+VAD_OK=false
+if $PYTHON_CMD -c "import onnxruntime" 2>/dev/null; then
+    VAD_OK=true
+else
+    MISSING_DEPS+=("onnxruntime")
+fi
+
 # 检查说话人分离依赖 (pyannote)
 PYANNOTE_OK=false
 if $PYTHON_CMD -c "from pyannote.audio import Pipeline" 2>/dev/null; then
@@ -131,14 +139,23 @@ else
     echo "   gradio: $($PYTHON_CMD -c "import gradio; print(gradio.__version__)" 2>/dev/null || echo 'N/A')"
 fi
 
-# 显示说话人分离状态
+# 显示功能状态 (安装后重新检查)
 echo ""
-if [ "$PYANNOTE_OK" = true ]; then
-    echo "✅ 说话人分离: pyannote.audio 已安装"
+echo "📋 功能状态:"
+
+# VAD 状态 (重新检查)
+if $PYTHON_CMD -c "import onnxruntime" 2>/dev/null; then
+    echo "   ✅ VAD (语音活动检测): Silero VAD 已就绪"
 else
-    echo "⚠️  说话人分离: pyannote.audio 未安装"
-    echo "   说话人分离将使用简化模式"
-    echo "   如需完整功能，运行: source .venv/bin/activate && pip install pyannote.audio torch torchaudio"
+    echo "   ⚠️  VAD: onnxruntime 未安装，VAD 功能将不可用"
+fi
+
+# 说话人分离状态
+if [ "$PYANNOTE_OK" = true ]; then
+    echo "   ✅ 说话人分离: pyannote.audio 已安装"
+else
+    echo "   ⚠️  说话人分离: pyannote.audio 未安装 (将使用简化模式)"
+    echo "      如需完整功能: pip install pyannote.audio torch torchaudio"
 fi
 
 # ===== 4. 检查 HF_TOKEN =====
