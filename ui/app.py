@@ -909,30 +909,31 @@ def create_ui():
             # ===== 左栏：配置 =====
             with gr.Column(scale=1):
                 
-                # 音频上传 - 支持重复点击上传
+                # 音频上传 - 支持多文件
                 audio_input = gr.File(
-                    label="📁 上传音频文件（点击可重新选择）",
+                    label="📁 上传音频文件（支持多文件，可逐个删除）",
                     file_types=[".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm"],
-                    file_count="single"
+                    file_count="multiple"
                 )
-                # 清除文件按钮
-                clear_file_btn = gr.Button("🗑️ 清除已上传文件", size="sm", variant="secondary")
                 
-                # 转录时间范围
-                gr.Markdown("##### ⏱️ 转录时间范围（留空=全部）")
+                # 转录时间范围（仅单文件可用）
+                time_range_note = gr.Markdown("##### ⏱️ 转录时间范围（仅单文件可用，留空=全部）")
                 with gr.Row():
                     start_minutes = gr.Textbox(
                         label="开始 (分钟)",
                         value="",
                         placeholder="0",
-                        info="留空或0=从头开始"
+                        info="留空或0=从头开始",
+                        interactive=True
                     )
                     end_minutes = gr.Textbox(
                         label="结束 (分钟)",
                         value="",
                         placeholder="留空=到结尾",
-                        info="留空=转录到结尾"
+                        info="留空=转录到结尾",
+                        interactive=True
                     )
+                time_range_error = gr.Markdown("", visible=False)
                 
                 gr.Markdown("---")
                 
@@ -1143,9 +1144,65 @@ def create_ui():
         download_json_btn.click(fn=download_json, outputs=[download_json_btn])
         download_srt_btn.click(fn=download_srt, outputs=[download_srt_btn])
         
-        # 提交转录
+        # 文件上传变化 - 多文件时禁用时间范围
+        def on_file_change(files):
+            if files is None or len(files) == 0:
+                # 无文件
+                return (
+                    gr.update(interactive=True),  # start_minutes
+                    gr.update(interactive=True),  # end_minutes
+                    "##### ⏱️ 转录时间范围（仅单文件可用，留空=全部）",  # time_range_note
+                    gr.update(visible=False, value="")  # time_range_error
+                )
+            elif len(files) == 1:
+                # 单文件 - 启用时间范围
+                return (
+                    gr.update(interactive=True),
+                    gr.update(interactive=True),
+                    "##### ⏱️ 转录时间范围（留空=全部）",
+                    gr.update(visible=False, value="")
+                )
+            else:
+                # 多文件 - 禁用时间范围
+                return (
+                    gr.update(interactive=False, value=""),
+                    gr.update(interactive=False, value=""),
+                    f"##### ⏱️ 转录时间范围（已上传 {len(files)} 个文件，多文件不支持时间范围）",
+                    gr.update(visible=False, value="")
+                )
+        
+        audio_input.change(
+            fn=on_file_change,
+            inputs=[audio_input],
+            outputs=[start_minutes, end_minutes, time_range_note, time_range_error]
+        )
+        
+        # 时间范围验证
+        def validate_time_range(start_str, end_str):
+            try:
+                start = float(start_str.strip()) if start_str and start_str.strip() else 0
+                end = float(end_str.strip()) if end_str and end_str.strip() else None
+                
+                if end is not None and start >= end:
+                    return gr.update(visible=True, value="❌ **错误**: 开始时间必须小于结束时间")
+                return gr.update(visible=False, value="")
+            except ValueError:
+                return gr.update(visible=True, value="❌ **错误**: 请输入有效的数字")
+        
+        start_minutes.change(
+            fn=validate_time_range,
+            inputs=[start_minutes, end_minutes],
+            outputs=[time_range_error]
+        )
+        end_minutes.change(
+            fn=validate_time_range,
+            inputs=[start_minutes, end_minutes],
+            outputs=[time_range_error]
+        )
+        
+        # 提交转录 - 支持多文件
         def on_submit(
-            audio_file,
+            audio_files,
             model_key,
             language_key,
             preset_key,
@@ -1163,17 +1220,11 @@ def create_ui():
             temperature,
             initial_prompt,
         ):
-            if audio_file is None:
+            if audio_files is None or len(audio_files) == 0:
                 yield "请先上传音频文件", "请先上传音频文件", "❌ 请先上传音频文件"
                 return
             
-            # 获取音频路径
-            if hasattr(audio_file, 'name'):
-                audio_path = audio_file.name
-            else:
-                audio_path = str(audio_file)
-            
-            # 处理 num_speakers - 空字符串表示自动检测
+            # 处理 num_speakers
             num_speakers = None
             if num_speakers_str and num_speakers_str.strip():
                 try:
@@ -1183,47 +1234,89 @@ def create_ui():
                 except ValueError:
                     num_speakers = None
             
-            # 处理开始时间 - 空或0表示从头开始
+            # 处理时间范围（仅单文件有效）
             start_minutes = None
-            if start_minutes_str and start_minutes_str.strip():
-                try:
-                    start_minutes = float(start_minutes_str.strip())
-                    if start_minutes < 0:
-                        start_minutes = None
-                except ValueError:
-                    start_minutes = None
-            
-            # 处理结束时间 - 空表示到结尾
             end_minutes = None
-            if end_minutes_str and end_minutes_str.strip():
-                try:
-                    end_minutes = float(end_minutes_str.strip())
-                    if end_minutes <= 0:
-                        end_minutes = None
-                except ValueError:
-                    end_minutes = None
             
-            # 调用转录函数
-            for log_text, result_text, status in transcribe_audio(
-                audio_path=audio_path,
-                model_key=model_key,
-                language_key=language_key,
-                preset_key=preset_key,
-                enable_diarization=enable_diarization,
-                num_speakers=num_speakers,
-                hf_token=hf_token,
-                vad_key=vad_key,
-                batch_size=int(batch_size),
-                start_minutes=start_minutes,
-                end_minutes=end_minutes,
-                no_speech_threshold=no_speech_threshold,
-                logprob_threshold=logprob_threshold,
-                compression_ratio_threshold=compression_ratio_threshold,
-                condition_on_previous_text=condition_on_previous_text,
-                temperature=temperature,
-                initial_prompt=initial_prompt,
-            ):
-                yield log_text, result_text, status
+            if len(audio_files) == 1:
+                # 单文件 - 解析时间范围
+                if start_minutes_str and start_minutes_str.strip():
+                    try:
+                        start_minutes = float(start_minutes_str.strip())
+                        if start_minutes < 0:
+                            start_minutes = None
+                    except ValueError:
+                        start_minutes = None
+                
+                if end_minutes_str and end_minutes_str.strip():
+                    try:
+                        end_minutes = float(end_minutes_str.strip())
+                        if end_minutes <= 0:
+                            end_minutes = None
+                    except ValueError:
+                        end_minutes = None
+                
+                # 验证时间范围
+                if start_minutes is not None and end_minutes is not None:
+                    if start_minutes >= end_minutes:
+                        yield "❌ 时间范围错误：开始时间必须小于结束时间", "", "❌ 时间范围错误"
+                        return
+            
+            # 处理文件列表
+            file_paths = []
+            for f in audio_files:
+                if hasattr(f, 'name'):
+                    file_paths.append(f.name)
+                else:
+                    file_paths.append(str(f))
+            
+            # 多文件处理
+            all_results = []
+            total_files = len(file_paths)
+            
+            for idx, audio_path in enumerate(file_paths):
+                file_name = Path(audio_path).name
+                
+                if total_files > 1:
+                    yield f"正在处理第 {idx + 1}/{total_files} 个文件: {file_name}", "\n".join(all_results), f"⏳ 处理中 ({idx + 1}/{total_files})"
+                
+                # 多文件时不使用时间范围
+                current_start = start_minutes if total_files == 1 else None
+                current_end = end_minutes if total_files == 1 else None
+                
+                # 调用转录函数
+                final_result = ""
+                for log_text, result_text, status in transcribe_audio(
+                    audio_path=audio_path,
+                    model_key=model_key,
+                    language_key=language_key,
+                    preset_key=preset_key,
+                    enable_diarization=enable_diarization,
+                    num_speakers=num_speakers,
+                    hf_token=hf_token,
+                    vad_key=vad_key,
+                    batch_size=int(batch_size),
+                    start_minutes=current_start,
+                    end_minutes=current_end,
+                    no_speech_threshold=no_speech_threshold,
+                    logprob_threshold=logprob_threshold,
+                    compression_ratio_threshold=compression_ratio_threshold,
+                    condition_on_previous_text=condition_on_previous_text,
+                    temperature=temperature,
+                    initial_prompt=initial_prompt,
+                ):
+                    final_result = result_text
+                    if total_files == 1:
+                        yield log_text, result_text, status
+                    else:
+                        yield log_text, "\n".join(all_results) + ("\n\n" if all_results else "") + result_text, f"⏳ 处理中 ({idx + 1}/{total_files}): {status}"
+                
+                if final_result:
+                    all_results.append(final_result)
+            
+            # 完成
+            if total_files > 1:
+                yield f"✅ 全部 {total_files} 个文件处理完成!", "\n\n".join(all_results), f"✅ 完成 ({total_files} 个文件)"
         
         submit_btn.click(
             fn=on_submit,
@@ -1247,12 +1340,6 @@ def create_ui():
                 initial_prompt
             ],
             outputs=[log_output, result_output, status_text]
-        )
-        
-        # 清除文件按钮
-        clear_file_btn.click(
-            fn=lambda: None,
-            outputs=[audio_input]
         )
     
     return app
