@@ -19,6 +19,7 @@ import time
 import json
 import tempfile
 import traceback
+import threading
 from pathlib import Path
 from typing import Optional, Tuple, List, Generator
 from dataclasses import dataclass
@@ -336,6 +337,13 @@ LAST_RESULT = {
     "preset": "",
 }
 
+# ========== 转录控制状态 ==========
+TRANSCRIBE_STATE = {
+    "is_paused": False,
+    "is_stopped": False,
+    "lock": threading.Lock(),  # 线程锁，保护状态变量
+}
+
 
 # ========== 核心转录函数 ==========
 
@@ -384,7 +392,23 @@ def transcribe_audio(
     Yields:
         (log_text, result_text, status)
     """
-    global LAST_RESULT
+    global LAST_RESULT, TRANSCRIBE_STATE
+    
+    def check_stop():
+        """检查是否应该停止"""
+        with TRANSCRIBE_STATE["lock"]:
+            return TRANSCRIBE_STATE["is_stopped"]
+    
+    def check_pause():
+        """检查是否暂停，如果暂停则等待"""
+        while True:
+            with TRANSCRIBE_STATE["lock"]:
+                if TRANSCRIBE_STATE["is_stopped"]:
+                    return True  # 停止信号，返回True表示应该退出
+                if not TRANSCRIBE_STATE["is_paused"]:
+                    return False  # 未暂停，继续执行
+            # 暂停状态，等待一小段时间后再次检查
+            time.sleep(0.1)
     
     logs = []
     
@@ -447,6 +471,11 @@ def transcribe_audio(
             yield log(f"      → 说话人数量: {num_speakers if num_speakers else '自动检测'}"), "", "⏳ 准备中..."
         yield log("─" * 40), "", "⏳ 准备中..."
         
+        # 检查停止信号
+        if check_stop():
+            yield log(""), "", "⏸️ 已停止"
+            return
+        
         # ===== 加载音频 =====
         yield log(""), "", "📂 加载音频..."
         yield log("📂 正在加载音频文件..."), "", "📂 加载音频..."
@@ -484,6 +513,16 @@ def transcribe_audio(
         yield log(f"   ✅ 加载完成!"), "", "📂 加载音频..."
         yield log(f"   📊 音频时长: {audio_duration:.1f} 秒 ({audio_duration/60:.1f} 分钟)"), "", "📂 加载音频..."
         yield log(f"   ⏱️ 加载耗时: {load_time:.2f} 秒"), "", "📂 加载音频..."
+        
+        # 检查停止信号
+        if check_stop():
+            yield log(""), "", "⏸️ 已停止"
+            return
+        
+        # 检查暂停信号
+        if check_pause():
+            yield log(""), "", "⏸️ 已停止"
+            return
         
         # ===== VAD 预处理 =====
         segment_mapping = [(0.0, audio_duration)]  # 默认：整个音频
@@ -528,6 +567,16 @@ def transcribe_audio(
                 # VAD 没有检测到可切分的片段
                 yield log(""), "", "🔊 VAD 完成"
                 yield log(f"🔊 ⚠️ VAD 未切分: 整段音频被视为连续语音"), "", "🔊 VAD 完成"
+        
+        # 检查停止信号
+        if check_stop():
+            yield log(""), "", "⏸️ 已停止"
+            return
+        
+        # 检查暂停信号
+        if check_pause():
+            yield log(""), "", "⏸️ 已停止"
+            return
         
         # ===== 转录 =====
         yield log(""), "", "🎤 转录中..."
@@ -583,6 +632,16 @@ def transcribe_audio(
             yield log(f"   🔊 VAD 效果: 跳过 {silence_skipped:.1f}s 静音"), "", "🎤 转录完成"
         yield log(f"   📝 识别段落: {len(segments)} 个"), "", "🎤 转录完成"
         yield log(f"   📄 文本长度: {len(text)} 字符"), "", "🎤 转录完成"
+        
+        # 检查停止信号
+        if check_stop():
+            yield log(""), "", "⏸️ 已停止"
+            return
+        
+        # 检查暂停信号
+        if check_pause():
+            yield log(""), "", "⏸️ 已停止"
+            return
         
         # ===== 说话人分离 =====
         speaker_segments = []
@@ -777,7 +836,7 @@ def update_model_batch(model_key: str):
 
 def download_txt():
     """生成 TXT 下载文件 - 简洁格式：A: 内容"""
-    if not LAST_RESULT["segments"]:
+    if not LAST_RESULT.get("segments"):
         return None
     
     # 收集所有说话人并映射到字母 A, B, C...
@@ -794,9 +853,23 @@ def download_txt():
     
     lines = []
     for seg in LAST_RESULT["segments"]:
-        text = seg['text'].strip()
+        # 使用 .get() 安全获取文本，避免 KeyError
+        text = seg.get('text', '').strip()
+        
+        # 跳过空文本
         if not text:
             continue
+        
+        # 检查文本是否异常（如果全是重复的"语音"等异常模式）
+        # 检测是否是重复的相同词汇（如"语音语音语音"）
+        if len(text) >= 4:  # 至少2个中文字符
+            # 检查是否是重复的2字符单位（如"语音语音语音"）
+            if len(text) % 2 == 0:
+                unit = text[0:2]
+                # 检查是否全是重复的相同2字符单位（至少重复2次）
+                if len(text) >= 4 and text == unit * (len(text) // 2):
+                    # 跳过异常数据（重复的相同词汇）
+                    continue
         
         spk = seg.get('speaker')
         if spk and spk in speaker_map:
@@ -806,8 +879,12 @@ def download_txt():
             # 没有说话人标签时直接输出文本
             lines.append(text)
     
+    # 如果没有有效内容，返回 None
+    if not lines:
+        return None
+    
     # 写入临时文件
-    audio_name = Path(LAST_RESULT['audio_path']).stem
+    audio_name = Path(LAST_RESULT.get('audio_path', 'transcription')).stem
     tmp_path = tempfile.mktemp(suffix=".txt", prefix=f"{audio_name}_")
     with open(tmp_path, 'w', encoding='utf-8') as f:
         f.write("\n".join(lines))
@@ -868,6 +945,56 @@ def download_srt():
         f.write("\n".join(lines))
     
     return tmp_path
+
+
+# ========== 转录控制函数 ==========
+
+def pause_transcription():
+    """暂停转录"""
+    global TRANSCRIBE_STATE
+    with TRANSCRIBE_STATE["lock"]:
+        TRANSCRIBE_STATE["is_paused"] = True
+    return (
+        "⏸️ 已暂停",
+        gr.update(visible=False),  # 隐藏暂停按钮
+        gr.update(visible=True),   # 显示继续按钮
+        gr.update(visible=True)    # 显示停止按钮
+    )
+
+
+def resume_transcription():
+    """恢复转录"""
+    global TRANSCRIBE_STATE
+    with TRANSCRIBE_STATE["lock"]:
+        TRANSCRIBE_STATE["is_paused"] = False
+    return (
+        "▶️ 已恢复",
+        gr.update(visible=True),   # 显示暂停按钮
+        gr.update(visible=False),  # 隐藏继续按钮
+        gr.update(visible=True)    # 显示停止按钮
+    )
+
+
+def stop_transcription():
+    """停止转录"""
+    global TRANSCRIBE_STATE
+    with TRANSCRIBE_STATE["lock"]:
+        TRANSCRIBE_STATE["is_stopped"] = True
+        TRANSCRIBE_STATE["is_paused"] = False  # 停止时清除暂停状态
+    return (
+        "⏹️ 已停止",
+        gr.update(visible=False),  # 隐藏暂停按钮
+        gr.update(visible=False), # 隐藏继续按钮
+        gr.update(visible=False)  # 隐藏停止按钮
+    )
+
+
+def reset_transcription_state():
+    """重置转录状态（在开始新转录时调用）"""
+    global TRANSCRIBE_STATE
+    with TRANSCRIBE_STATE["lock"]:
+        TRANSCRIBE_STATE["is_paused"] = False
+        TRANSCRIBE_STATE["is_stopped"] = False
 
 
 # ========== UI 构建 ==========
@@ -1104,8 +1231,12 @@ def create_ui():
                     info="引导模型识别特定术语、人名、主题"
                 )
                 
-                # 开始按钮
-                submit_btn = gr.Button("🚀 开始转录", variant="primary", size="lg")
+                # 控制按钮行
+                with gr.Row():
+                    submit_btn = gr.Button("🚀 开始转录", variant="primary", size="lg", scale=2)
+                    pause_btn = gr.Button("⏸️ 暂停", variant="secondary", size="lg", scale=1, visible=False)
+                    resume_btn = gr.Button("▶️ 继续", variant="secondary", size="lg", scale=1, visible=False)
+                    stop_btn = gr.Button("⏹️ 停止", variant="stop", size="lg", scale=1, visible=False)
             
             # ===== 右栏：结果 =====
             with gr.Column(scale=1):
@@ -1189,9 +1320,12 @@ def create_ui():
             temperature,
             initial_prompt,
         ):
+            # 重置转录状态
+            reset_transcription_state()
+            
             # 处理文件列表（支持单个文件或多个文件）
             if audio_file is None:
-                yield "请先上传音频文件", "请先上传音频文件", "❌ 请先上传音频文件"
+                yield "请先上传音频文件", "请先上传音频文件", "❌ 请先上传音频文件", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
                 return
             
             # 将单个文件转换为列表格式，统一处理
@@ -1201,7 +1335,7 @@ def create_ui():
                 audio_files = audio_file
             
             if len(audio_files) == 0:
-                yield "请先上传音频文件", "请先上传音频文件", "❌ 请先上传音频文件"
+                yield "请先上传音频文件", "请先上传音频文件", "❌ 请先上传音频文件", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
                 return
             
             # 处理 num_speakers - 空字符串表示自动检测
@@ -1239,6 +1373,9 @@ def create_ui():
             all_results_text = ""
             is_multiple = len(audio_files) > 1
             
+            # 开始转录时显示控制按钮
+            yield "开始转录...", "", "⏳ 准备中...", gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
+            
             for file_idx, audio_file_item in enumerate(audio_files):
                 # 获取音频路径
                 if hasattr(audio_file_item, 'name'):
@@ -1255,7 +1392,8 @@ def create_ui():
                         all_results_text += "\n\n" + file_separator + "\n"
                     else:
                         all_results_text = file_separator + "\n"
-                    yield "\n".join(all_logs), all_results_text, f"⏳ 处理文件 {file_idx + 1}/{len(audio_files)}..."
+                    # 显示控制按钮
+                    yield "\n".join(all_logs), all_results_text, f"⏳ 处理文件 {file_idx + 1}/{len(audio_files)}...", gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
                 
                 # 调用转录函数
                 file_result = ""
@@ -1303,7 +1441,31 @@ def create_ui():
                         current_status = f"{status} | 文件 {file_idx + 1}/{len(audio_files)}"
                     else:
                         current_status = status
-                    yield "\n".join(all_logs), all_results_text, current_status
+                    
+                    # 检查是否暂停或停止
+                    with TRANSCRIBE_STATE["lock"]:
+                        is_paused = TRANSCRIBE_STATE["is_paused"]
+                        is_stopped = TRANSCRIBE_STATE["is_stopped"]
+                    
+                    # 根据状态更新按钮可见性
+                    if is_stopped:
+                        pause_visible = False
+                        resume_visible = False
+                        stop_visible = False
+                    elif is_paused:
+                        pause_visible = False
+                        resume_visible = True
+                        stop_visible = True
+                    else:
+                        pause_visible = True
+                        resume_visible = False
+                        stop_visible = True
+                    
+                    yield "\n".join(all_logs), all_results_text, current_status, gr.update(visible=pause_visible), gr.update(visible=resume_visible), gr.update(visible=stop_visible)
+                    
+                    # 如果已停止，退出循环
+                    if is_stopped:
+                        break
                 
                 # 文件处理完成，添加分隔（多文件模式）
                 if is_multiple and file_idx < len(audio_files) - 1:
@@ -1311,11 +1473,18 @@ def create_ui():
                     all_results_text += "\n\n"
             
             # 所有文件处理完成
-            if is_multiple:
+            with TRANSCRIBE_STATE["lock"]:
+                is_stopped = TRANSCRIBE_STATE["is_stopped"]
+            
+            if is_stopped:
+                final_status = "⏹️ 已停止"
+            elif is_multiple:
                 final_status = f"✅ 全部完成 | 共处理 {len(audio_files)} 个文件"
             else:
                 final_status = "✅ 完成"
-            yield "\n".join(all_logs), all_results_text, final_status
+            
+            # 完成后隐藏控制按钮
+            yield "\n".join(all_logs), all_results_text, final_status, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
         
         submit_btn.click(
             fn=on_submit,
@@ -1338,7 +1507,25 @@ def create_ui():
                 temperature,
                 initial_prompt
             ],
-            outputs=[log_output, result_output, status_text]
+            outputs=[log_output, result_output, status_text, pause_btn, resume_btn, stop_btn]
+        )
+        
+        # 暂停按钮
+        pause_btn.click(
+            fn=pause_transcription,
+            outputs=[status_text, pause_btn, resume_btn, stop_btn]
+        )
+        
+        # 继续按钮
+        resume_btn.click(
+            fn=resume_transcription,
+            outputs=[status_text, pause_btn, resume_btn, stop_btn]
+        )
+        
+        # 停止按钮
+        stop_btn.click(
+            fn=stop_transcription,
+            outputs=[status_text, pause_btn, resume_btn, stop_btn]
         )
         
         # 上传文件按钮 - 触发文件选择对话框

@@ -278,3 +278,5 @@ def align_transcription_with_speakers(
     
     return segments, speaker_stats
 
+
+

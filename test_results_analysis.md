@@ -179,3 +179,5 @@ result = model.transcribe(concatenated_audio)
 
 **建议**: 继续推进拼接方案，并根据模型选择合适的 batch_size。
 
+
+
